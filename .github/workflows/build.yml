@@ -36,7 +36,7 @@ on:
         description: "Minutes the build may run before it stops and saves its shader cache (a run is capped at 6 hours)"
         required: false
         type: number
-        default: 300
+        default: 290
       chain_left:
         description: "How many more runs to start automatically when a build stops at its time budget"
         required: false
@@ -113,7 +113,7 @@ jobs:
         env:
           ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           sw_vers; sysctl -n hw.ncpu hw.memsize
           df -h /System/Volumes/Data 2>/dev/null || df -h /
           XC=/Applications/Xcode_27.2.app
@@ -235,7 +235,7 @@ jobs:
           PROGRESS_ISSUE: ${{ vars.PROGRESS_ISSUE }}
           PROGRESS_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail   # GitHub starts bash with -e: a stopped build (exit 143) must reach the checks below
           tok="$PROGRESS_TOKEN"; unset PROGRESS_TOKEN
           mkdir -p "$OUT_DIR" "$LOG_DIR"
           log="$LOG_DIR/build.log"
