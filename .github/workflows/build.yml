@@ -1,0 +1,290 @@
+name: NxNative IPA Builder
+
+# Builds an unsigned iOS IPA with nxnative on GitHub's free macOS runner (public repo, standard xcode-27 runner).
+# Nothing from any game is stored in this repository in readable form:
+# - the game files arrive as an AES-256 encrypted 7z archive (release "game-files", made by tools/nx.py upload);
+# - the IPA and the build logs leave as AES-256 encrypted 7z archives (release ipa-<run>, artifact logs-<run>).
+# The password is the ARCHIVE_PASSWORD secret. Switch 1 games also need the PROD_KEYS_B64 secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Build path"
+        required: true
+        type: choice
+        default: "iPhone 15 Pro or newer (standard)"
+        options:
+          - "iPhone 15 Pro or newer (standard)"
+          - "iPhone 15 or older (BC fallback)"
+      nxnative_ref:
+        description: "nxnative commit or branch (blank = the pinned commit for the chosen path)"
+        required: false
+        type: string
+        default: ""
+      extra_args:
+        description: "Extra build options, e.g. --romfs separate --shader-files"
+        required: false
+        type: string
+        default: ""
+      allow_other_metal:
+        description: "Build shaders even when the Metal compiler is not Xcode 27.2's (may render wrong)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # publishes the encrypted IPA as a release
+  issues: write     # mirrors build progress into the progress issue
+
+concurrency:
+  group: nxnative-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27   # standard runner: free for public repositories (never use the -xlarge label here)
+    timeout-minutes: 360
+
+    steps:
+      - name: Check secrets
+        shell: bash
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+        run: |
+          if [[ -z "$ARCHIVE_PASSWORD" ]]; then
+            echo "::error::The ARCHIVE_PASSWORD secret is missing. Run: python tools/nx.py upload <game file>"
+            exit 1
+          fi
+
+      - name: Choose nxnative source
+        id: src
+        shell: bash
+        env:
+          DEVICE: ${{ inputs.device }}
+          REF_IN: ${{ inputs.nxnative_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$DEVICE" == *"BC fallback"* ]]; then
+            repo=mianmuhammadse/nxnative; pin=b5ecea6a7241689db07030fa14bc79fd89b06225; label=BC-Fallback
+          else
+            repo=seedds/nxnative; pin=23790f8dcc3a3491a44f125805dfbf1e5664cd2a; label=Standard
+          fi
+          ref="${REF_IN:-$pin}"
+          {
+            echo "repo=$repo"
+            echo "ref=$ref"
+            echo "label=$label"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GAME_DIR=$RUNNER_TEMP/GameFiles"
+            echo "KEYS_DIR=$RUNNER_TEMP/keys"
+            echo "OUT_DIR=$RUNNER_TEMP/out"
+            echo "LOG_DIR=$RUNNER_TEMP/logs"
+          } >> "$GITHUB_ENV"
+          echo "Building with $repo @ $ref ($label)"
+
+      - name: Check out nxnative
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.src.outputs.repo }}
+          ref: ${{ steps.src.outputs.ref }}
+          path: nxnative
+          persist-credentials: false
+
+      - name: Select Xcode 27.2 and free disk space
+        shell: bash
+        env:
+          ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal }}
+        run: |
+          set -uo pipefail
+          sw_vers; sysctl -n hw.ncpu hw.memsize
+          df -h /System/Volumes/Data 2>/dev/null || df -h /
+          XC=/Applications/Xcode_27.2.app
+          if [[ -d "$XC" ]]; then
+            sudo xcode-select -s "$XC"
+            keep="$(cd "$XC" && pwd -P)"
+            for x in /Applications/Xcode*.app; do
+              real="$(cd "$x" 2>/dev/null && pwd -P || true)"
+              [[ "$real" == "$keep" ]] && continue
+              echo "Removing $x"; sudo rm -rf "$x"
+            done
+          elif [[ "$ALLOW_OTHER_METAL" == "true" ]]; then
+            echo "::warning::Xcode 27.2 is not on this runner image; using $(xcode-select -p) (allow_other_metal)."
+          else
+            echo "::error::Xcode 27.2 is not on this runner image (found: $(ls -d /Applications/Xcode*.app | xargs -n1 basename | tr '\n' ' ')). Re-run with allow_other_metal, or update the workflow."
+            exit 1
+          fi
+          sudo rm -rf "${ANDROID_HOME:-/nonexistent-android}" "$HOME/Library/Android" 2>/dev/null || true
+          xcodebuild -version
+          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "Downloading the Metal toolchain"
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk iphoneos metal --version || { echo "::error::The Metal toolchain is not available"; exit 1; }
+          echo "Lock expects: $(grep metal_iphoneos nxnative/dm/gfx/tools/dmsh_chain.lock || true)"
+          df -h /System/Volumes/Data 2>/dev/null || df -h /
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang sevenzip
+          python -m pip install --upgrade pip
+          python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
+
+      - name: Fetch and decrypt game files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          set -euo pipefail
+          DL="$RUNNER_TEMP/dl"
+          mkdir -p "$GAME_DIR" "$KEYS_DIR" "$DL"
+          gh release download game-files -R "$GITHUB_REPOSITORY" -D "$DL" -p 'game.7z.*'
+          ls -la "$DL"
+          first="$(ls "$DL"/game.7z.* | sort | sed -n 1p)"
+          7zz x -y -bso0 -bsp0 -p"$ARCHIVE_PASSWORD" -o"$GAME_DIR" "$first"
+          rm -rf "$DL"
+
+          # Packages may sit in a subfolder of the archive; keys may have been packed with them.
+          find "$GAME_DIR" -mindepth 2 -type f \( -iname '*.nup' -o -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv -n {} "$GAME_DIR/" \;
+          k="$(find "$GAME_DIR" -type f -iname 'prod.keys' | sed -n 1p)"
+          if [[ -n "$k" ]]; then mv "$k" "$KEYS_DIR/prod.keys"; fi
+          if [[ -n "${PROD_KEYS_B64:-}" ]]; then
+            python -c "import base64,os,sys; sys.stdout.buffer.write(base64.b64decode(os.environ['PROD_KEYS_B64']))" > "$KEYS_DIR/prod.keys"
+          fi
+          [[ -f "$KEYS_DIR/prod.keys" ]] && chmod 600 "$KEYS_DIR/prod.keys"
+          find "$GAME_DIR" -mindepth 1 -type d -empty -delete
+
+          shopt -s nullglob nocaseglob
+          nups=("$GAME_DIR"/*.nup)
+          pkgs=("$GAME_DIR"/*.nsp "$GAME_DIR"/*.xci "$GAME_DIR"/*.nsz "$GAME_DIR"/*.xcz)
+          if (( ${#nups[@]} > 0 )); then
+            echo "GAME_KIND=switch2" >> "$GITHUB_ENV"
+            echo "Switch 2 game (.nup): no keys needed"
+          elif (( ${#pkgs[@]} > 0 )); then
+            if [[ ! -s "$KEYS_DIR/prod.keys" ]]; then
+              echo "::error::Switch 1 games need prod.keys. Add it with: python tools/nx.py keys <path to prod.keys>"
+              exit 1
+            fi
+            echo "GAME_KIND=switch1" >> "$GITHUB_ENV"
+            echo "Switch 1 game: ${#pkgs[@]} package(s)"
+          else
+            echo "::error::The archive holds no .nup, .nsp, .xci, .nsz or .xcz file."
+            ls -laR "$GAME_DIR"
+            exit 1
+          fi
+
+          biggest="$(ls -S "$GAME_DIR" | sed -n 1p)"
+          stem="$(printf '%s' "${biggest%.*}" | sed -E 's/\[[^]]*\]//g; s/[^A-Za-z0-9._-]+/_/g; s/^_+//; s/_+$//')"
+          echo "IPA_NAME=${stem:-Game}" >> "$GITHUB_ENV"
+          ls -la "$GAME_DIR"
+          df -h "$RUNNER_TEMP"
+
+      - name: Build IPA
+        shell: bash
+        working-directory: nxnative
+        env:
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+          ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal }}
+          PROGRESS_ISSUE: ${{ vars.PROGRESS_ISSUE }}
+          PROGRESS_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          tok="$PROGRESS_TOKEN"; unset PROGRESS_TOKEN
+          mkdir -p "$OUT_DIR" "$LOG_DIR"
+          log="$LOG_DIR/build.log"
+          : > "$log"
+          args=("$GAME_DIR" --platform ios -o "$OUT_DIR/$IPA_NAME.ipa" --progress lines)
+          if [[ "$GAME_KIND" == "switch1" ]]; then args+=(-k "$KEYS_DIR/prod.keys"); fi
+          if [[ "$ALLOW_OTHER_METAL" == "true" ]]; then args+=(--allow-other-metal); fi
+          extra=()
+          if [[ -n "$EXTRA_ARGS" ]]; then read -r -a extra <<< "$EXTRA_ARGS"; fi
+          echo "+ build_ipa_from_nsp.py ${args[*]} ${extra[*]:-}"
+
+          post() {   # mirror the last log lines into the progress issue (edits do not notify anyone)
+            [[ -n "${PROGRESS_ISSUE:-}" ]] || return 0
+            local body
+            body="$(printf '**Run %s** (%s) - %s - %s UTC\n\n```\n%s\n```\n' "$GITHUB_RUN_NUMBER" "$IPA_NAME" "$1" "$(date -u '+%Y-%m-%d %H:%M')" "$(tail -n 25 "$log" | cut -c1-240)")"
+            GH_TOKEN="$tok" gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$PROGRESS_ISSUE" -f body="$body" >/dev/null 2>&1 || true
+          }
+          ( while sleep 240; do post running; done ) &
+          updater=$!
+
+          python scripts/build_ipa_from_nsp.py "${args[@]}" ${extra[@]+"${extra[@]}"} < /dev/null 2>&1 | tee -a "$log"
+          status=${PIPESTATUS[0]}
+          kill "$updater" 2>/dev/null || true
+          if (( status == 0 )); then post "build finished"; else post "build FAILED (exit $status)"; fi
+          ls -lh "$OUT_DIR" || true
+          exit "$status"
+
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$LOG_DIR"
+          for d in "$GAME_DIR"/*_build/logs "$GAME_DIR"/*_survey; do
+            [[ -d "$d" ]] && cp -R "$d" "$LOG_DIR/$(basename "$(dirname "$d")")-$(basename "$d")"
+          done
+          du -sh "$LOG_DIR" || true
+
+      - name: Encrypt and publish the IPA
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+          LABEL: ${{ steps.src.outputs.label }}
+          SRC_REPO: ${{ steps.src.outputs.repo }}
+          SRC_REF: ${{ steps.src.outputs.ref }}
+        run: |
+          set -euo pipefail
+          ipa="$OUT_DIR/$IPA_NAME.ipa"
+          if [[ ! -s "$ipa" ]]; then
+            echo "::error::The build did not produce $IPA_NAME.ipa"
+            ls -la "$OUT_DIR" || true
+            exit 1
+          fi
+          ls -lh "$ipa"
+          rm -rf "$GAME_DIR" "$KEYS_DIR"   # room for the archive
+          up="$RUNNER_TEMP/upload"; mkdir -p "$up"
+          (cd "$OUT_DIR" && 7zz a -t7z -mx=0 -mhe=on -v1900m -bso0 -bsp0 -p"$ARCHIVE_PASSWORD" "$up/ipa.7z" "$IPA_NAME.ipa")
+          rm -f "$ipa"
+          ls -lh "$up"
+          tag="ipa-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" "$up"/* -R "$GITHUB_REPOSITORY" --prerelease \
+            --title "Encrypted build $GITHUB_RUN_NUMBER ($LABEL)" \
+            --notes "Encrypted with the repository's archive password. Built from $SRC_REPO@$SRC_REF. Download with: python tools/nx.py get-ipa $tag"
+          echo "### Encrypted IPA published: release \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Encrypt logs
+        if: always()
+        shell: bash
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+        run: |
+          [[ -d "$LOG_DIR" ]] || exit 0
+          (cd "$LOG_DIR" && 7zz a -t7z -mx=9 -mhe=on -bso0 -bsp0 -p"$ARCHIVE_PASSWORD" "$RUNNER_TEMP/logs-${GITHUB_RUN_NUMBER}.7z" .) || true
+
+      - name: Upload encrypted logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ github.run_number }}
+          path: ${{ runner.temp }}/logs-${{ github.run_number }}.7z
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove game files and keys
+        if: always()
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/GameFiles" "$RUNNER_TEMP/keys" "$RUNNER_TEMP/dl" "$RUNNER_TEMP/upload" "$RUNNER_TEMP/out"

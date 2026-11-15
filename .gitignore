@@ -1,0 +1,14 @@
+.secrets/
+ipas/
+logs/
+__pycache__/
+*.ipa
+*.7z
+*.7z.*
+*.nup
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.keys
+.nx-upload/
