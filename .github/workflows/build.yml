@@ -108,6 +108,13 @@ jobs:
           path: nxnative
           persist-credentials: false
 
+      - name: Check out builder tools
+        uses: actions/checkout@v7
+        with:
+          path: builder
+          sparse-checkout: tools
+          persist-credentials: false
+
       - name: Select Xcode 27.2 and free disk space
         shell: bash
         env:
@@ -131,7 +138,15 @@ jobs:
             echo "::error::Xcode 27.2 is not on this runner image (found: $(ls -d /Applications/Xcode*.app | xargs -n1 basename | tr '\n' ' ')). Re-run with allow_other_metal, or update the workflow."
             exit 1
           fi
-          sudo rm -rf "${ANDROID_HOME:-/nonexistent-android}" "$HOME/Library/Android" 2>/dev/null || true
+          # A big game's build needs well over 100 GB (Pokopia: ~25 GB compile cache, ~30 GB shader library, a ~36 GB IPA).
+          # None of this is used by the build: simulators, .NET, Android, other tool versions, browsers.
+          sudo xcrun simctl runtime delete all >/dev/null 2>&1 || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Images /Library/Developer/CoreSimulator/Cryptex /Library/Developer/CoreSimulator/Profiles/Runtimes \
+            "$HOME/Library/Developer/CoreSimulator" "$HOME/Library/Developer/XCTestDevices" \
+            "$HOME/.dotnet" /usr/local/share/dotnet "${ANDROID_HOME:-/nonexistent-android}" "$HOME/Library/Android" /usr/local/lib/android \
+            "/Applications/Google Chrome.app" "/Applications/Google Chrome for Testing.app" "/Applications/Firefox.app" "/Applications/Microsoft Edge.app" \
+            "$HOME/.rustup" "$HOME/.cargo" "$HOME/.ghcup" "$HOME/.julia" /usr/local/microsoft "$HOME/Library/Caches" 2>/dev/null || true
+          for x in "${RUNNER_TOOL_CACHE:-$HOME/hostedtoolcache}"/*; do [[ "$(basename "$x")" == Python ]] || sudo rm -rf "$x"; done
           xcodebuild -version
           if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
             echo "Downloading the Metal toolchain"
@@ -155,6 +170,10 @@ jobs:
           brew install xcodegen zstd glslang sevenzip
           python -m pip install --upgrade pip
           python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
+
+      - name: Keep the shader compile cache compressed
+        shell: bash
+        run: python builder/tools/patch_nxnative.py nxnative   # fails if nxnative changed under the patch
 
       - name: Fetch and decrypt game files
         shell: bash
@@ -215,15 +234,33 @@ jobs:
           ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
         run: |
           set -euo pipefail
-          tag="$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("shader-cache-"))] | sort_by(.createdAt) | last | .tagName // empty')"
+          tags="$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("shader-cache-"))] | sort_by(.createdAt) | reverse | .[].tagName')"
+          tag=""; kind=""
+          for t in $tags; do   # newest complete one: streamed parts end with complete.txt; older 7z saves were made whole
+            assets="$(gh release view "$t" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            if grep -qx 'complete.txt' <<< "$assets"; then tag="$t"; kind=stream; break; fi
+            if grep -qx 'cache.7z.001' <<< "$assets"; then tag="$t"; kind=7z; break; fi
+            echo "::warning::$t is incomplete: skipped"
+          done
           if [[ -z "$tag" ]]; then echo "No saved shader cache: starting fresh"; exit 0; fi
-          echo "Restoring the shader cache from $tag"
-          d="$RUNNER_TEMP/cachedl"; mkdir -p "$d"
-          gh release download "$tag" -R "$GITHUB_REPOSITORY" -D "$d" -p 'cache.7z.*'
-          7zz x -y -bso0 -bsp0 -p"$ARCHIVE_PASSWORD" -o"$GAME_DIR" "$(ls "$d"/cache.7z.* | sort | sed -n 1p)"
-          rm -rf "$d"
-          du -sh "$GAME_DIR"/*_build/shader/cache 2>/dev/null || true
+          echo "Restoring the shader cache from $tag ($kind)"
+          if [[ "$kind" == stream ]]; then
+            OSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"; [[ -x "$OSSL" ]] || OSSL=openssl
+            python builder/tools/stream_parts.py download "$tag" cache.tzst.enc. \
+              | "$OSSL" enc -d -aes-256-ctr -md sha256 -pbkdf2 -iter 200000 -pass env:ARCHIVE_PASSWORD \
+              | zstd -d -q -c | tar -xf - -C "$GAME_DIR"
+          else
+            d="$RUNNER_TEMP/cachedl"; mkdir -p "$d"
+            gh release download "$tag" -R "$GITHUB_REPOSITORY" -D "$d" -p 'cache.7z.*'
+            7zz x -y -bso0 -bsp0 -p"$ARCHIVE_PASSWORD" -o"$GAME_DIR" "$(ls "$d"/cache.7z.* | sort | sed -n 1p)"
+            rm -rf "$d"
+          fi
+          shopt -s nullglob
+          dbs=("$GAME_DIR"/*_build/shader/cache/cas*.db)
+          if (( ${#dbs[@]} > 0 )); then python builder/tools/compress_cache.py "${dbs[@]}"; fi   # blobs from unpatched builds
+          du -sh "$GAME_DIR"/*_build/shader/cache || true
+          df -h "$GAME_DIR"
 
       - name: Build IPA
         shell: bash
@@ -237,6 +274,7 @@ jobs:
         run: |
           set +e -uo pipefail   # GitHub starts bash with -e: a stopped build (exit 143) must reach the checks below
           tok="$PROGRESS_TOKEN"; unset PROGRESS_TOKEN
+          touch "$RUNNER_TEMP/build-ran"   # the cache is saved only after a build ran on it
           mkdir -p "$OUT_DIR" "$LOG_DIR"
           log="$LOG_DIR/build.log"
           : > "$log"
@@ -250,7 +288,7 @@ jobs:
           post() {   # mirror the last log lines into the progress issue (edits do not notify anyone)
             [[ -n "${PROGRESS_ISSUE:-}" ]] || return 0
             local body
-            body="$(printf '**Run %s** (%s) - %s - %s UTC\n\n```\n%s\n```\n' "$GITHUB_RUN_NUMBER" "$IPA_NAME" "$1" "$(date -u '+%Y-%m-%d %H:%M')" "$(tail -n 25 "$log" | cut -c1-240)")"
+            body="$(printf '**Run %s** (%s) - %s - %s UTC - disk free: %s\n\n```\n%s\n```\n' "$GITHUB_RUN_NUMBER" "$IPA_NAME" "$1" "$(date -u '+%Y-%m-%d %H:%M')" "$(df -h "$GAME_DIR" | awk 'NR==2 {print $4}')" "$(tail -n 25 "$log" | cut -c1-240)")"
             GH_TOKEN="$tok" gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$PROGRESS_ISSUE" -f body="$body" >/dev/null 2>&1 || true
           }
           ( while sleep 240; do post running; done ) &
@@ -295,26 +333,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -uo pipefail
           shopt -s nullglob
+          if [[ ! -f "$RUNNER_TEMP/build-ran" ]]; then echo "The build did not run: nothing new to save"; exit 0; fi
+          if [[ "${BUILD_STOPPED:-}" != "1" && "$JOB_STATUS" == "success" ]]; then echo "The build finished: the IPA is all that is kept"; exit 0; fi
           dirs=("$GAME_DIR"/*_build/shader/cache)
           if (( ${#dirs[@]} == 0 )); then echo "No shader cache to save"; exit 0; fi
           cache="${dirs[0]}"
           for db in "$cache"/cas*.db; do sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null || true; done
-          du -sh "$cache"; ls -la "$cache"
-          pack="$RUNNER_TEMP/cachepack"; rm -rf "$pack"; mkdir -p "$pack"
+          du -sh "$cache"; ls -la "$cache"; df -h "$GAME_DIR"
           rel="${cache#"$GAME_DIR"/}"
-          (cd "$GAME_DIR" && 7zz a -t7z -mx=1 -mhe=on -v1900m -bso0 -bsp0 -p"$ARCHIVE_PASSWORD" "$pack/cache.7z" "$rel") || exit 1
-          ls -lh "$pack"
-          tag="shader-cache-${GITHUB_RUN_NUMBER}"
+          tag="shader-cache-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           old="$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName | select(startswith("shader-cache-"))')"
-          gh release create "$tag" "$pack"/* -R "$GITHUB_REPOSITORY" --prerelease \
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --prerelease \
             --title "Encrypted shader cache (run $GITHUB_RUN_NUMBER)" \
-            --notes "AES-256 encrypted nxnative compile cache, restored by the next build." || exit 1
+            --notes "AES-256 encrypted nxnative compile cache (tar | zstd | openssl aes-256-ctr, in parts), restored by the next build." || exit 1
+          # Streamed: compressed, encrypted and uploaded part by part, so no second copy of the cache is ever on disk.
+          OSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"; [[ -x "$OSSL" ]] || OSSL=openssl
+          if tar -C "$GAME_DIR" -cf - "$rel" | zstd -1 -T0 -q -c \
+              | "$OSSL" enc -aes-256-ctr -md sha256 -pbkdf2 -iter 200000 -salt -pass env:ARCHIVE_PASSWORD \
+              | python builder/tools/stream_parts.py upload "$tag" cache.tzst.enc.; then
+            date -u > "$RUNNER_TEMP/complete.txt"
+            gh release upload "$tag" "$RUNNER_TEMP/complete.txt" -R "$GITHUB_REPOSITORY" || exit 1
+          else
+            echo "::error::Saving the shader cache failed; the previous one is kept."
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true
+            exit 1
+          fi
           echo "CACHE_SAVED=1" >> "$GITHUB_ENV"
           for t in $old; do [[ "$t" == "$tag" ]] || gh release delete "$t" -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true; done
-          rm -rf "$pack"
 
       - name: Encrypt and publish the IPA
         if: env.BUILD_STOPPED != '1'
