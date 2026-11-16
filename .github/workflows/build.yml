@@ -319,6 +319,28 @@ jobs:
               sleep 20
             done ) &
           guard=$!
+          # The IPA pack writes the whole IPA beside its sources (Pokopia: 41 GB) and ran out of disk in run 9. Once the shader stage is done and every
+          # shader came from the restored cache (so that cache's release already holds everything), the cache file and the game container
+          # (unpacked by then) are removed to make the room; the save step then keeps the release as it is.
+          ( while kill -0 "$pid" 2>/dev/null; do
+              sleep 15
+              line="$(grep -m1 -E '\] iOS shaders \([0-9:]+\): [0-9,]+ of [0-9,]+ shaders ready' "$log")"
+              [[ -n "$line" ]] || continue
+              { echo "disk after the shader stage:"; df -h "$GAME_DIR" | tail -n 1
+                du -xk -d 3 "$GAME_DIR" 2>/dev/null | sort -n | tail -n 15 | awk '{printf "%7.1f GiB  %s\n", $1 / 1048576, $2}'; } >> "$log"
+              read -r ready all cached <<< "$(sed -E 's#.*\): ([0-9,]+) of ([0-9,]+) shaders ready \(([0-9,]+) from the cache\).*#\1 \2 \3#' <<< "$line" | tr -d ',')"
+              if ! [[ "${cached:-x}" == "$ready" && "$ready" =~ ^[0-9]+$ ]]; then echo "disk: this run compiled shaders; the cache file stays to be saved" >> "$log"; exit 0; fi
+              for f in "$GAME_DIR"/*_build/shader/cache/cas*.db "$GAME_DIR"/*.nup; do
+                [[ -f "$f" ]] || continue
+                for _ in $(seq 40); do lsof "$f" >/dev/null 2>&1 || break; sleep 15; done
+                if lsof "$f" >/dev/null 2>&1; then echo "disk: $f is still open; left in place" >> "$log"; continue; fi
+                if [[ "$f" == *.db ]]; then touch "$RUNNER_TEMP/cache-dropped"; fi
+                rm -f "$f" "$f-wal" "$f-shm"; echo "disk: removed $f" >> "$log"
+              done
+              df -h "$GAME_DIR" | tail -n 1 >> "$log"
+              exit 0
+            done ) &
+          spacer=$!
           budget=$(( ${BUILD_MINUTES:-290} * 60 ))
           # Leave time to save the cache before the job's 360-minute limit: its size now plus what a run adds, at ~15 MB/s, plus margin.
           cache_kb=$(du -sk "$GAME_DIR"/*_build/shader/cache 2>/dev/null | awk '{s += $1} END {print s + 0}')
@@ -335,7 +357,7 @@ jobs:
             fi ) &
           timer=$!
           wait "$pid"; status=$?
-          kill "$updater" "$timer" "$guard" 2>/dev/null || true
+          kill "$updater" "$timer" "$guard" "$spacer" 2>/dev/null || true
           sleep 2
           if [[ -f "$RUNNER_TEMP/cache-mismatch" ]]; then
             post "STOPPED: the restored shader cache does not match this runner; nothing was saved"
@@ -374,6 +396,7 @@ jobs:
           shopt -s nullglob
           if [[ ! -f "$RUNNER_TEMP/build-ran" ]]; then echo "The build did not run: nothing new to save"; exit 0; fi
           if [[ -f "$RUNNER_TEMP/cache-mismatch" ]]; then echo "The restored cache did not match: the saved one stays as it is"; exit 0; fi
+          if [[ -f "$RUNNER_TEMP/cache-dropped" ]]; then echo "Every shader came from the restored cache, whose release stays as it is (its file was removed to make room for the IPA)"; exit 0; fi
           if [[ "${BUILD_STOPPED:-}" != "1" && "$JOB_STATUS" == "success" ]]; then echo "The build finished: the IPA is all that is kept"; exit 0; fi
           dirs=("$GAME_DIR"/*_build/shader/cache)
           if (( ${#dirs[@]} == 0 )); then echo "No shader cache to save"; exit 0; fi
@@ -426,9 +449,12 @@ jobs:
           rm -f "$ipa"
           ls -lh "$up"
           tag="ipa-${GITHUB_RUN_NUMBER}"
-          gh release create "$tag" "$up"/* -R "$GITHUB_REPOSITORY" --prerelease \
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --prerelease \
             --title "Encrypted build $GITHUB_RUN_NUMBER ($LABEL)" \
             --notes "Encrypted with the repository's archive password. Built from $SRC_REPO@$SRC_REF. Download with: python tools/nx.py get-ipa $tag"
+          # Three volumes at a time, each retried: a failed upload here would lose hours of build
+          export tag
+          printf '%s\n' "$up"/* | xargs -P 3 -n 1 bash -c 'for i in 1 2 3 4 5; do gh release upload "$tag" "$0" --clobber -R "$GITHUB_REPOSITORY" && { echo "uploaded ${0##*/}"; exit 0; }; sleep $(( i * 20 )); done; echo "::error::${0##*/} did not upload"; exit 1'
           echo "### Encrypted IPA published: release \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Encrypt logs
