@@ -19,6 +19,7 @@ import time
 
 PART = int(os.environ.get('NX_PART_BYTES', 1900 * 2**20))
 CHUNK = 8 * 2**20
+UPLOADERS = int(os.environ.get('NX_UPLOADERS', 3))   # one upload ran at ~20 MB/s and slowed down; parts upload side by side
 
 
 def gh(*args, tries=4):
@@ -44,15 +45,16 @@ def worker(jobs, errors, fn):
 
 def upload(tag, prefix):
     tmp = tempfile.mkdtemp(prefix='parts-', dir=os.environ.get('RUNNER_TEMP'))
-    jobs, errors = queue.Queue(maxsize=1), []
+    jobs, errors = queue.Queue(maxsize=UPLOADERS), []
 
     def send(path):
         gh('release', 'upload', tag, path, '--clobber')
         os.remove(path)
         print(f'uploaded {os.path.basename(path)}', file=sys.stderr, flush=True)
 
-    t = threading.Thread(target=worker, args=(jobs, errors, send), daemon=True)
-    t.start()
+    threads = [threading.Thread(target=worker, args=(jobs, errors, send), daemon=True) for _ in range(UPLOADERS)]
+    for t in threads:
+        t.start()
     src, n, sent, total = sys.stdin.buffer, 0, 0, 0
     try:
         while not errors:
@@ -73,8 +75,10 @@ def upload(tag, prefix):
             if size < PART:
                 break
     finally:
-        jobs.put(None)
-        t.join()
+        for _ in threads:
+            jobs.put(None)
+        for t in threads:
+            t.join()
         shutil.rmtree(tmp, ignore_errors=True)
     if errors:
         raise SystemExit(f'upload failed: {errors[0]}')

@@ -68,6 +68,7 @@ jobs:
         env:
           ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
         run: |
+          echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"   # the time budget below keeps the save inside the 6-hour job limit
           if [[ -z "$ARCHIVE_PASSWORD" ]]; then
             echo "::error::The ARCHIVE_PASSWORD secret is missing. Run: python tools/nx.py upload <game file>"
             exit 1
@@ -296,11 +297,18 @@ jobs:
 
           python scripts/build_ipa_from_nsp.py "${args[@]}" ${extra[@]+"${extra[@]}"} < /dev/null > >(tee -a "$log") 2>&1 &
           pid=$!
-          budget=$(( ${BUILD_MINUTES:-300} * 60 ))
+          budget=$(( ${BUILD_MINUTES:-290} * 60 ))
+          # Leave time to save the cache before the job's 360-minute limit: its size now plus what a run adds, at ~15 MB/s, plus margin.
+          cache_kb=$(du -sk "$GAME_DIR"/*_build/shader/cache 2>/dev/null | awk '{s += $1} END {print s + 0}')
+          save_s=$(( (cache_kb + 10 * 1024 * 1024) / 15360 + 600 ))
+          left=$(( JOB_T0 + 352 * 60 - $(date +%s) - save_s - 240 ))
+          if (( left < budget )); then budget=$left; fi
+          if (( budget < 600 )); then budget=600; fi
+          echo "Time budget: $(( budget / 60 )) minutes (cache $(( cache_kb / 1048576 )) GiB, $(( save_s / 60 )) minutes kept for saving it)"
           ( sleep "$budget"
             if kill -0 "$pid" 2>/dev/null; then
               touch "$RUNNER_TEMP/stopped"
-              echo "Time budget of ${BUILD_MINUTES} minutes reached: stopping the build to save its shader cache" >> "$log"
+              echo "Time budget of $(( budget / 60 )) minutes reached: stopping the build to save its shader cache" >> "$log"
               kill -TERM "$pid"; sleep 240; kill -KILL "$pid" 2>/dev/null
             fi ) &
           timer=$!
@@ -310,7 +318,7 @@ jobs:
           if [[ -f "$RUNNER_TEMP/stopped" ]]; then
             echo "BUILD_STOPPED=1" >> "$GITHUB_ENV"
             post "stopped at the time budget; saving the shader cache for the next run"
-            echo "::notice::Stopped at the ${BUILD_MINUTES}-minute budget; the next run continues from the saved shader cache."
+            echo "::notice::Stopped at the $(( budget / 60 ))-minute budget; the next run continues from the saved shader cache."
             exit 0
           fi
           if (( status == 0 )); then post "build finished"; else post "build FAILED (exit $status)"; fi
