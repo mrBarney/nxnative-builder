@@ -295,8 +295,30 @@ jobs:
           ( while sleep 240; do post running; done ) &
           updater=$!
 
+          expected=0   # shaders the restored cache holds (index entries); the guard below checks the build finds them
+          for db in "$GAME_DIR"/*_build/shader/cache/cas*.db; do
+            [[ -f "$db" ]] && expected=$(( expected + $(sqlite3 "$db" "SELECT count(*) FROM entry WHERE name >= 'index/' AND name < 'index0'" 2>/dev/null || echo 0) ))
+          done
+          echo "The restored cache holds $expected shaders"
+
           python scripts/build_ipa_from_nsp.py "${args[@]}" ${extra[@]+"${extra[@]}"} < /dev/null > >(tee -a "$log") 2>&1 &
           pid=$!
+          # If the cache's keys stop matching (a runner image changed the compiler's identity), stop at once and save nothing:
+          # saving would replace the good cache with one this build starts over in.
+          ( while kill -0 "$pid" 2>/dev/null; do
+              m="$(grep -m1 -oE '[0-9,]+/[0-9,]+ shaders, [0-9,]+ not cached' "$log" | tr -d ',')"
+              if [[ -n "$m" ]]; then
+                read -r total notc <<< "$(sed -E 's#^[0-9]+/([0-9]+) shaders,? ([0-9]+) not cached#\1 \2#' <<< "$m")"
+                if (( expected >= 1000 && total - notc < expected / 2 )); then
+                  touch "$RUNNER_TEMP/cache-mismatch"
+                  echo "The restored cache holds $expected shaders but the build found only $(( total - notc )): stopping without saving" >> "$log"
+                  kill -TERM "$pid"; sleep 120; kill -KILL "$pid" 2>/dev/null
+                fi
+                exit 0
+              fi
+              sleep 20
+            done ) &
+          guard=$!
           budget=$(( ${BUILD_MINUTES:-290} * 60 ))
           # Leave time to save the cache before the job's 360-minute limit: its size now plus what a run adds, at ~15 MB/s, plus margin.
           cache_kb=$(du -sk "$GAME_DIR"/*_build/shader/cache 2>/dev/null | awk '{s += $1} END {print s + 0}')
@@ -313,8 +335,13 @@ jobs:
             fi ) &
           timer=$!
           wait "$pid"; status=$?
-          kill "$updater" "$timer" 2>/dev/null || true
+          kill "$updater" "$timer" "$guard" 2>/dev/null || true
           sleep 2
+          if [[ -f "$RUNNER_TEMP/cache-mismatch" ]]; then
+            post "STOPPED: the restored shader cache does not match this runner; nothing was saved"
+            echo "::error::The restored shader cache ($expected shaders) does not match this runner's compiler identity. Nothing was saved; the cache release is untouched."
+            exit 1
+          fi
           if [[ -f "$RUNNER_TEMP/stopped" ]]; then
             echo "BUILD_STOPPED=1" >> "$GITHUB_ENV"
             post "stopped at the time budget; saving the shader cache for the next run"
@@ -346,6 +373,7 @@ jobs:
           set -uo pipefail
           shopt -s nullglob
           if [[ ! -f "$RUNNER_TEMP/build-ran" ]]; then echo "The build did not run: nothing new to save"; exit 0; fi
+          if [[ -f "$RUNNER_TEMP/cache-mismatch" ]]; then echo "The restored cache did not match: the saved one stays as it is"; exit 0; fi
           if [[ "${BUILD_STOPPED:-}" != "1" && "$JOB_STATUS" == "success" ]]; then echo "The build finished: the IPA is all that is kept"; exit 0; fi
           dirs=("$GAME_DIR"/*_build/shader/cache)
           if (( ${#dirs[@]} == 0 )); then echo "No shader cache to save"; exit 0; fi
@@ -354,7 +382,8 @@ jobs:
           du -sh "$cache"; ls -la "$cache"; df -h "$GAME_DIR"
           rel="${cache#"$GAME_DIR"/}"
           tag="shader-cache-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
-          old="$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName | select(startswith("shader-cache-"))')"
+          # Older caches to delete after this save: all but the newest, which stays as a fallback.
+          old="$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt             --jq '[.[] | select(.tagName | startswith("shader-cache-"))] | sort_by(.createdAt) | reverse | .[1:] | .[].tagName')"
           gh release create "$tag" -R "$GITHUB_REPOSITORY" --prerelease \
             --title "Encrypted shader cache (run $GITHUB_RUN_NUMBER)" \
             --notes "AES-256 encrypted nxnative compile cache (tar | zstd | openssl aes-256-ctr, in parts), restored by the next build." || exit 1
